@@ -27,7 +27,7 @@ AI는 이 컴퓨터에 로그인된 **Claude Code CLI(`claude -p`)** 를 그대�
 ## 설치 · 실행
 
 ```bash
-git clone https://github.com/<your-id>/paper-reader.git
+git clone https://github.com/Shape-Kim/paper-reader.git
 cd paper-reader
 python3 server.py
 ```
