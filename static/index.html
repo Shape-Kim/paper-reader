@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper Reader</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <button id="homeBtn" class="icon" title="홈" aria-label="홈"><span class="ic" data-icon="home"></span></button>
+  <span id="brand" class="brand">Paper Reader</span>
+  <a id="paperTitle" class="ptitle" target="_blank" rel="noopener" hidden></a>
+  <div class="spacer"></div>
+  <button id="paletteBtn" class="search-pill" title="논문 열기·찾기 (⌘K)"><span class="ic" data-icon="search"></span><span class="pill-text">논문 열기·찾기</span><kbd>⌘K</kbd></button>
+  <button id="settingsBtn" class="icon" title="설정" aria-label="설정"><span class="ic" data-icon="settings"></span></button>
+</header>
+
+<main id="main">
+  <section id="viewer">
+    <div id="home" class="home">
+      <div class="home-head">
+        <div class="seg" id="homeTabs">
+          <button data-src="lib">서재</button><button data-src="hf">인기</button><button data-src="mine" title="설정의 「내 분야 키워드」로 arXiv 최신 논문">내 분야</button>
+        </div>
+        <input id="feedDate" type="date" title="Hugging Face 날짜(비우면 최근)" hidden>
+      </div>
+      <div id="shelfBar" class="shelfbar" hidden></div>
+      <div id="homeList" class="list"></div>
+    </div>
+    <iframe id="paperFrame" title="논문" hidden></iframe>
+
+    <div id="viewBar" class="viewbar" hidden>
+      <button id="pgPrev" class="icon sm" title="이전 쪽" aria-label="이전 쪽"><span class="ic" data-icon="chevronLeft"></span></button>
+      <button id="pgLabel" class="vtext" title="쪽 번호를 눌러 이동">–</button>
+      <button id="pgNext" class="icon sm" title="다음 쪽" aria-label="다음 쪽"><span class="ic" data-icon="chevronRight"></span></button>
+      <span class="vsep"></span>
+      <button id="zoomOut" class="icon sm" title="축소 (⌘−)" aria-label="축소"><span class="ic" data-icon="minus"></span></button>
+      <button id="zoomLabel" class="vtext" title="폭에 맞추기 (⌘0)">100%</button>
+      <button id="zoomIn" class="icon sm" title="확대 (⌘+)" aria-label="확대"><span class="ic" data-icon="plus"></span></button>
+      <span class="vsep"></span>
+      <button id="tocBtn" class="icon sm" title="목차" aria-label="목차"><span class="ic" data-icon="list"></span></button>
+      <button id="viewMenuBtn" class="icon sm" title="더 보기" aria-label="더 보기"><span class="ic" data-icon="dots"></span></button>
+    </div>
+    <div id="tocPanel" class="menu toc" hidden></div>
+    <div id="viewMenu" class="menu" hidden>
+      <button data-m="view"><span class="ic" data-icon="fileText"></span><span class="mtext">HTML판으로 보기</span></button>
+      <button data-m="arxiv"><span class="ic" data-icon="external"></span><span>arXiv에서 열기</span></button>
+      <button data-m="shelf"><span class="ic" data-icon="bookmark"></span><span>폴더에 넣기…</span></button>
+      <button data-m="rename"><span class="ic" data-icon="pencil"></span><span>이름 바꾸기</span></button>
+      <button data-m="remove" class="danger"><span class="ic" data-icon="trash"></span><span>서재에서 빼기</span></button>
+    </div>
+
+    <div id="capOverlay" class="cap-overlay" hidden><div id="capRect" class="cap-rect"></div><div class="cap-hint">그림 영역을 끌어서 고르세요 · Esc 취소</div></div>
+    <div id="loading" class="loading" hidden>논문을 받는 중…</div>
+  </section>
+  <div id="divider" title="끌어서 너비 조절"></div>
+  <aside id="chat">
+    <div class="chat-head">
+      <div class="tabs">
+        <button class="tab on" data-tab="chatPane">대화</button>
+        <button class="tab" data-tab="notesPane" id="notesTab">메모 <span id="noteCount"></span></button>
+      </div>
+      <div class="spacer"></div>
+      <button id="chatMenuBtn" class="icon" title="더 보기" aria-label="대화 메뉴"><span class="ic" data-icon="dots"></span></button>
+    </div>
+    <div id="chatMenu" class="menu chatmenu" hidden>
+      <button data-c="packet"><span class="ic" data-icon="fileText"></span><span>세미나자료 열기</span></button>
+      <button data-c="folder"><span class="ic" data-icon="folder"></span><span>자료 폴더 열기</span></button>
+      <button data-c="reset"><span class="ic" data-icon="messagePlus"></span><span>새 대화 <small class="muted">이전 대화는 파일로 보관</small></span></button>
+    </div>
+    <div id="chatPane" class="pane">
+      <div id="messages" class="messages"></div>
+      <div class="composer-wrap">
+        <div id="slashMenu" class="menu slash" hidden></div>
+        <div id="runMenu" class="menu run" hidden>
+          <div class="mlabel">모델</div>
+          <div class="seg" id="modelSeg"><button data-v="sonnet">Sonnet</button><button data-v="opus">Opus</button><button data-v="haiku">Haiku</button></div>
+          <div class="mlabel">노력 <span class="muted">높을수록 깊이 생각하지만 느립니다</span></div>
+          <div class="seg" id="effortSeg"><button data-v="auto">기본</button><button data-v="low">낮음</button><button data-v="medium">보통</button><button data-v="high">높음</button><button data-v="xhigh">매우 높음</button><button data-v="max">최대</button></div>
+        </div>
+        <form id="askForm" class="composer">
+          <div id="quoteBox" class="quote-chip" hidden><span id="quoteText"></span><button type="button" id="quoteClear" class="x" title="인용 빼기" aria-label="인용 빼기"><span class="ic" data-icon="x"></span></button></div>
+          <div id="attachBox" class="attach-box" hidden></div>
+          <textarea id="askInput" rows="1" placeholder="질문하기 · / 빠른 질문"></textarea>
+          <div class="composer-row">
+            <button type="button" id="captureBtn" class="icon sm" title="그림 캡처 — 논문에서 영역을 끌어 질문에 붙이기" aria-label="그림 캡처"><span class="ic" data-icon="crop"></span></button>
+            <div class="spacer"></div>
+            <button type="button" id="runBtn" class="run-pill" title="모델·노력"><span id="runText">Sonnet · 기본</span><span class="ic" data-icon="chevronDown"></span></button>
+            <button type="submit" id="sendBtn" class="send" title="보내기 (Enter)" aria-label="보내기"><span class="ic" data-icon="arrowUp"></span></button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div id="notesPane" class="pane" hidden>
+      <div id="notesList" class="notes"></div>
+    </div>
+  </aside>
+</main>
+
+<div id="selPop" class="selpop" hidden>
+  <button data-act="ref" id="refAct" title="이 참고문헌을 arXiv에서 찾아 열기" hidden>논문 찾기</button>
+  <button data-act="ask">질문</button>
+  <button data-act="explain">설명</button>
+  <button data-act="translate">번역</button>
+  <span class="sep"></span>
+  <button data-act="highlight" class="icon" title="하이라이트(메모 탭에 저장 · 메모는 거기서)" aria-label="하이라이트"><span class="ic" data-icon="highlight"></span></button>
+</div>
+<div id="refPop" class="refpop" hidden></div>
+<div id="citePop" class="citepop" hidden></div>
+
+<div id="palette" class="overlay" hidden>
+  <div class="palette" role="dialog" aria-label="논문 열기·찾기">
+    <div class="pal-input"><span class="ic" data-icon="search"></span><input id="palInput" placeholder="arXiv 주소·ID를 붙여넣거나, 서재·제목으로 찾기" autocomplete="off" spellcheck="false"></div>
+    <div id="palList" class="pal-list"></div>
+    <div class="pal-foot">↵ 열기 · ↑↓ 고르기 · Esc 닫기 · PDF는 화면에 끌어다 놓아도 됩니다</div>
+  </div>
+</div>
+<input id="fileInput" type="file" accept="application/pdf" hidden>
+<div id="dropHint" class="drop-hint" hidden>PDF를 놓으면 엽니다</div>
+
+<div id="settings" class="overlay" hidden>
+  <div class="sheet" role="dialog" aria-label="설정">
+    <div class="sheet-head"><b>설정</b><div class="spacer"></div><button class="icon" id="settingsClose" aria-label="닫기"><span class="ic" data-icon="x"></span></button></div>
+    <section>
+      <h3>설명 방식 기억 <span id="memCount" class="muted"></span></h3>
+      <p class="muted">모든 논문 대화에 함께 들어갑니다. 대화에서 「앞으로 이렇게 설명해 줘」라고 하면 Claude가 한 줄씩 넣습니다. <code>- </code>로 시작하는 줄 하나가 규칙 하나입니다.</p>
+      <textarea id="memText" class="mem-text" spellcheck="false"></textarea>
+      <div class="mem-foot"><span id="memPath" class="muted"></span><button id="memSave" class="btn" disabled>저장</button></div>
+    </section>
+    <section>
+      <h3>내 분야 키워드</h3>
+      <p class="muted">홈 「내 분야」 탭이 arXiv(cs.LG·cs.AI·cs.CL·cs.CV·cs.RO·cs.AR·stat.ML·eess.SY)에서 이 낱말이 든 최신 논문을 보여 줍니다. 쉼표로 나눠 12개까지. 비우면 기본값(large language model·reasoning·agent·reinforcement learning…)을 씁니다.</p>
+      <input id="kwText" class="kw-text" spellcheck="false" placeholder="large language model, reasoning, agent, diffusion model">
+    </section>
+    <section>
+      <h3>논문 기본 보기</h3>
+      <div class="seg" id="viewPref"><button data-v="pdf">PDF 원문</button><button data-v="html">arXiv HTML</button></div>
+      <p class="muted">HTML판은 arXiv가 자동으로 만든 판이라 모양이 다르지만, 수식을 드래그하면 LaTeX로 정확히 넘어갑니다. 논문마다 ⋯ 메뉴에서도 바꿀 수 있습니다.</p>
+    </section>
+    <section>
+      <h3>단축키</h3>
+      <div class="keys">
+        <span><kbd>⌘K</kbd> 논문 열기·찾기</span><span><kbd>⌘F</kbd> 논문 전문 검색</span><span><kbd>/</kbd> 빠른 질문</span>
+        <span><kbd>⌘</kbd><kbd>+</kbd> <kbd>⌘</kbd><kbd>−</kbd> <kbd>⌘</kbd><kbd>0</kbd> 확대·축소·폭 맞춤</span><span><kbd>Esc</kbd> 닫기·중지</span>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div id="shelfMenu" class="menu shelfmenu" role="menu" aria-label="폴더 고르기" hidden></div>
+<div id="toast" class="toast" hidden></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.3.0/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

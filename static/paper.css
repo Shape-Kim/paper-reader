@@ -1,0 +1,5 @@
+/* arXiv HTML 논문 안에 덧붙이는 읽기용 스타일 */
+::selection { background: rgba(245, 150, 70, .4); }
+/* arXiv 배너·머리말·꼬리말·피드백 버튼 등 읽기에 불필요한 것 */
+#announcement-banner, .arxiv-html-header, .arxiv-html-footer, .ds-site-footer, #fixed-buttons-container,
+#modal-form, .ltx_page_header, .ltx_page_footer, #ltx-feedback-button, .package-alerts { display: none !important; }

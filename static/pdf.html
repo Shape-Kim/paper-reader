@@ -1,0 +1,1099 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF</title>
+<style>
+  html { overflow-y: scroll; }
+  html, body { margin: 0; background: #e9e8e4; }
+  #pages { position: relative; padding: 18px 16px 80px; }
+  /* content-visibility: offscreen pages skip style/layout (zooming a 90-page paper re-lays only the visible ones);
+     their text stays in the DOM, so Cmd+F still finds it */
+  .page { position: relative; margin: 0 auto 14px; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.18); content-visibility: auto; }
+  .page > canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+  .textLayer { position: absolute; inset: 0; overflow: hidden; line-height: 1; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; z-index: 2; }
+  .textLayer span, .textLayer br { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0% 0%; }
+  .textLayer ::selection { background: rgba(245, 150, 70, .35); }
+  .textLayer .endOfContent { display: block; position: absolute; inset: 100% 0 0; z-index: -1; cursor: default; user-select: none; }
+  .textLayer .endOfContent.active { top: 0; }
+  /* pages with /Rotate: pdf.js lays the text out unrotated and marks the layer (same rules as pdf_viewer.css) */
+  .textLayer[data-main-rotation="90"] { transform: rotate(90deg) translateY(-100%); }
+  .textLayer[data-main-rotation="180"] { transform: rotate(180deg) translate(-100%, -100%); }
+  .textLayer[data-main-rotation="270"] { transform: rotate(270deg) translateX(-100%); }
+  .prLinks { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+  .prLinks a { position: absolute; pointer-events: auto; cursor: pointer; border-radius: 2px; }
+  .prLinks a:hover { background: rgba(70, 130, 240, .12); }
+  .pr-flash { position: absolute; z-index: 4; pointer-events: none; border-radius: 3px; background: rgba(255, 196, 0, .32); box-shadow: 0 0 0 2px rgba(245, 150, 30, .6); animation: pr-flash 1.6s ease-out forwards; }
+  @keyframes pr-flash { 0% { opacity: 0; } 10%, 65% { opacity: 1; } 100% { opacity: 0; } }
+  .pr-card { position: fixed; z-index: 20; width: max-content; max-width: min(440px, calc(100vw - 16px)); box-sizing: border-box; padding: 9px 12px 8px; background: #fff; color: #222; border: 1px solid rgba(0,0,0,.12); border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
+  .pr-card .h { font-size: 11px; color: #888; margin-bottom: 3px; }
+  .pr-card .t { max-height: 10.5em; overflow: auto; overscroll-behavior: contain; word-break: break-word; }
+  .pr-card .b { display: flex; gap: 6px; justify-content: flex-end; margin-top: 7px; }
+  .pr-card button { font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 6px; border: 1px solid rgba(0,0,0,.15); background: #f5f4f0; color: #333; cursor: pointer; }
+  .pr-card button:hover { background: #eae8e2; }
+  #msg { font: 14px -apple-system, sans-serif; color: #666; text-align: center; padding: 40px; }
+  @media (prefers-color-scheme: dark) {
+    html, body { background: #2a2a2c; }
+    .page { box-shadow: 0 1px 6px rgba(0,0,0,.55); }
+    #msg { color: #9a9a9a; }
+  }
+</style>
+</head>
+<body>
+<div id="msg">PDF를 여는 중…</div>
+<div id="pages"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+(() => {
+  "use strict";
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+  const params = new URLSearchParams(location.search);
+  const wrap = document.getElementById("pages"), msg = document.getElementById("msg");
+  const STEPS = [0.5, 0.67, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+  const MAX_PIXELS = 25e6;  // per canvas: past this (very high zoom) a page is drawn at a lower pixel density
+  const BUDGET = 60e6;      // canvas pixels kept alive in total (~240 MB); far offscreen pages give theirs up first
+
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const clampZoom = (z) => clamp(Math.round(z * 1000) / 1000, 0.5, 3);
+  const vw = () => document.documentElement.clientWidth;
+  const vh = () => document.documentElement.clientHeight;
+  const pct = (v, total) => (100 * v / total).toFixed(3) + "%";
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const idle = () => new Promise((r) => (window.requestIdleCallback ? requestIdleCallback(() => r(), { timeout: 200 }) : setTimeout(r, 30)));
+
+  let pdf = null, pgs = [], tops = [], fitW = 800, curPage = 1, isReady = false;
+  let zoom = clampZoom(+params.get("zoom") || 1);
+  let readyOk, readyFail;
+  const ready = new Promise((ok, fail) => { readyOk = ok; readyFail = fail; });
+  ready.catch(() => {});  // a failed load is shown in #msg; don't report an unhandled rejection
+
+  // ================= layout =================
+  // Every page is fit-to-width × zoom. Sizes are whole pixels so the page box, the canvas and the text layer
+  // (pdf.js sizes it as round(var(--scale-factor) * width)) line up exactly.
+  function measureFit() {
+    const w = vw();
+    return w > 120 ? Math.min(w - 32, 1000) : fitW;  // a hidden iframe reports width 0: keep the last width
+  }
+  function measureTops() { tops = pgs.map((p) => wrap.offsetTop + p.div.offsetTop); }
+  function applySizes() {
+    const W = Math.max(60, Math.round(fitW * zoom));
+    for (const p of pgs) {
+      p.W = W; p.H = Math.round(W * p.bh / p.bw); p.scale = W / p.bw;
+      const s = p.div.style;
+      s.width = W + "px"; s.height = p.H + "px";
+      s.setProperty("--scale-factor", p.scale);
+      p.div.dataset.scale = p.scale;
+      // the v3 text layer positions spans in % and calc(var(--scale-factor) * …): it follows without re-rendering
+      if (p.tl) p.tl.style.setProperty("--scale-factor", p.scale);
+    }
+    measureTops();
+  }
+  function pageAt(y) {  // index of the last page whose top is at or above y
+    let lo = 0, hi = tops.length - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (tops[m] <= y) lo = m; else hi = m - 1; }
+    return lo;
+  }
+  // a point of the view (vy px below its top) as page + fraction, so a re-layout can put it back in place
+  function anchorAt(vy) {
+    const i = pageAt(scrollY + vy), p = pgs[i];
+    return { i, vy, f: (scrollY + vy - tops[i]) / p.H, fx: (scrollX + vw() / 2 - p.div.offsetLeft) / p.W };
+  }
+  function restoreAnchor(a) {
+    const p = pgs[a.i];
+    scrollTo(Math.max(0, p.div.offsetLeft + a.fx * p.W - vw() / 2), Math.max(0, tops[a.i] + a.f * p.H - a.vy));
+  }
+  // zoom keeps the middle of the view in place; a width change keeps the top line (= position()) in place
+  function relayout(vy) {
+    if (!isReady) return;
+    const a = anchorAt(vy);
+    applySizes();
+    restoreAnchor(a);
+    for (const p of pgs) if (p.task && p.taskKey !== canvasKey(p)) p.task.cancel();  // drawing at a stale size
+    updateCurrent(); schedule(); relayoutTextLater();
+  }
+  function setZoom(z) {
+    z = clampZoom(+z || 1);
+    if (Math.abs(z - zoom) > 1e-4) { zoom = z; relayout(vh() / 2); emitView(); }
+    return zoom;
+  }
+  const zoomIn = () => setZoom(STEPS.find((s) => s > zoom + 1e-3) ?? 3);
+  const zoomOut = () => setZoom([...STEPS].reverse().find((s) => s < zoom - 1e-3) ?? 0.5);
+
+  let resizeT = 0, lastDpr = devicePixelRatio;
+  addEventListener("resize", () => {
+    clearTimeout(resizeT);
+    resizeT = setTimeout(() => {
+      const f = measureFit();
+      if (f !== fitW) { fitW = f; relayout(0); }
+      else if (isReady) { measureTops(); updateCurrent(); }
+      if (devicePixelRatio !== lastDpr) { lastDpr = devicePixelRatio; schedule(); relayoutTextLater(); }  // new screen density
+    }, 150);
+  });
+
+  // ================= canvases (lazy, nearest to the view first) =================
+  function outScale(p) {
+    const d = devicePixelRatio || 1;
+    return p.W * p.H * d * d > MAX_PIXELS ? Math.sqrt(MAX_PIXELS / (p.W * p.H)) : d;
+  }
+  const canvasKey = (p) => p.W + "x" + p.H + "@" + outScale(p).toFixed(4);
+  let active = 0, queued = false, settleWaiters = [];
+  function schedule() {
+    if (queued) return;
+    queued = true;
+    queueMicrotask(() => { queued = false; pump(); });
+  }
+  function pump() {
+    if (!isReady) return;
+    for (const p of pgs) if (p.near && p.tl && p.tlKey !== textKey(p)) relayoutText(p);
+    const mid = scrollY + vh() / 2;
+    while (active < 2) {
+      let best = null, bd = Infinity;
+      for (const p of pgs) {
+        if (!p.near || p.task || p.canvasKey === canvasKey(p)) continue;
+        const d = Math.abs(tops[p.i] + p.H / 2 - mid);
+        if (d < bd) { bd = d; best = p; }
+      }
+      if (!best) break;
+      draw(best);
+    }
+    evict();
+  }
+  function draw(p) {
+    const key = canvasKey(p), os = outScale(p), vp = p.proxy.getViewport({ scale: p.scale });
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.round(p.W * os)); cv.height = Math.max(1, Math.round(p.H * os));
+    const task = p.proxy.render({
+      canvasContext: cv.getContext("2d", { alpha: false }), viewport: vp,
+      transform: [cv.width / vp.width, 0, 0, cv.height / vp.height, 0, 0],
+    });
+    p.task = task; p.taskKey = key; active++;
+    task.promise.then(() => {
+      // swap only when the new bitmap is complete; until then the old one stays, stretched by CSS (no blank flash)
+      if (p.canvas) { p.canvas.replaceWith(cv); p.canvas.width = p.canvas.height = 0; } else p.div.prepend(cv);
+      p.canvas = cv; p.canvasKey = key;
+      if (!p.linksDone) { p.linksDone = true; buildLinks(p); }
+    }, (err) => {
+      cv.width = cv.height = 0;
+      if (!err || err.name !== "RenderingCancelledException") console.warn("PDF page " + p.n + " render failed", err);
+    }).finally(() => {
+      p.task = null; active--;
+      if (!active) settleWaiters.splice(0).forEach((f) => f());
+      schedule();
+    });
+  }
+  function evict() {
+    let total = 0; const far = [];
+    for (const p of pgs) if (p.canvas) { total += p.canvas.width * p.canvas.height; if (!p.near && !p.task) far.push(p); }
+    if (total <= BUDGET) return;
+    far.sort((a, b) => Math.abs(b.i - curPage + 1) - Math.abs(a.i - curPage + 1));
+    for (const p of far) {
+      if (total <= BUDGET) break;
+      total -= p.canvas.width * p.canvas.height;
+      p.canvas.width = p.canvas.height = 0; p.canvas.remove(); p.canvas = null; p.canvasKey = "";
+    }
+  }
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const p = pgs[e.target.dataset.n - 1];
+      p.near = e.isIntersecting;
+      if (p.near) ensureTextLayer(p);
+    }
+    schedule();
+  }, { root: document, rootMargin: "800px 0px" });  // root: document — with the implicit root, an iframe's own
+  // viewport clips the targets and the margin never applies, so pages would only start drawing once visible
+
+  // ================= text layers (all pages, so the browser's Cmd+F finds text everywhere) =================
+  const textContent = (p) => p.tc || (p.tc = p.proxy.getTextContent());
+  const textKey = (p) => p.scale * (devicePixelRatio || 1);
+  async function ensureTextLayer(p) {
+    if (p.tl || p.tlBusy || p.tlFailed) return;
+    p.tlBusy = true;
+    let tl = null;
+    try {
+      const tc = await textContent(p);
+      const sc = p.scale;
+      tl = document.createElement("div");
+      tl.className = "textLayer";
+      tl.style.setProperty("--scale-factor", sc);  // renderTextLayer checks it against viewport.scale
+      p.div.appendChild(tl);
+      p.textDivs = []; p.textProps = new WeakMap();
+      await pdfjsLib.renderTextLayer({ textContentSource: tc, container: tl, viewport: p.proxy.getViewport({ scale: sc }), textDivs: p.textDivs, textDivProperties: p.textProps }).promise;
+      const end = document.createElement("div"); end.className = "endOfContent"; tl.appendChild(end);
+      p.tl = tl; p.tlKey = sc * (devicePixelRatio || 1);
+      window.dispatchEvent(new CustomEvent("pr-page", { detail: tl }));  // the parent re-applies its highlights
+    } catch (e) {
+      if (tl && !p.tl) tl.remove();
+      p.tlFailed = true;  // don't retry forever
+      console.warn("PDF text layer " + p.n + " failed", e);
+    } finally { p.tlBusy = false; }
+  }
+  // After a zoom the spans already follow --scale-factor; this only re-measures each span's horizontal stretch
+  // (scaleX) for the new size, like pdf.js's viewer does. The spans themselves (and marks inside) are untouched.
+  function relayoutText(p) {
+    p.tlKey = textKey(p);
+    try {
+      pdfjsLib.updateTextLayer({ container: p.tl, viewport: { scale: p.scale, rotation: 0 }, textDivs: p.textDivs, textDivProperties: p.textProps, mustRotate: false, mustRescale: true });
+    } catch (e) { console.warn("PDF text layer " + p.n + " re-measure failed", e); }
+  }
+  let relayoutRunning = false;
+  async function relayoutTextLater() {  // offscreen pages: one page per idle slot
+    if (relayoutRunning) return;
+    relayoutRunning = true;
+    try {
+      for (let p; (p = pgs.find((q) => q.tl && q.tlKey !== textKey(q)));) {
+        await idle();
+        if (p.tlKey !== textKey(p)) relayoutText(p);
+      }
+    } finally { relayoutRunning = false; }
+  }
+  const rendersSettled = (ms) => new Promise((r) => { if (!active) return r(); settleWaiters.push(r); setTimeout(r, ms); });
+  async function buildAllText() {
+    for (;;) {
+      await rendersSettled(400);  // let visible pages draw first
+      const todo = pgs.filter((p) => !p.tl && !p.tlBusy && !p.tlFailed)
+        .sort((a, b) => (b.near - a.near) || Math.abs(a.i - curPage + 1) - Math.abs(b.i - curPage + 1)).slice(0, 4);
+      if (!todo.length) return;
+      todo.forEach(textContent);  // keep the worker busy with the next pages
+      const dl = await new Promise((r) => (window.requestIdleCallback ? requestIdleCallback(r, { timeout: 200 }) : setTimeout(r, 30)));
+      for (const p of todo) {  // as many pages as fit in this idle period (at least one)
+        await ensureTextLayer(p);
+        if (!dl || !dl.timeRemaining || dl.timeRemaining() < 10) break;
+      }
+    }
+  }
+
+  // ================= text geometry for find / previews (from getTextContent; works without a canvas) =================
+  // Lines are runs of consecutive items (content-stream order, so two columns stay apart) on one baseline.
+  // Coordinates are in page units at scale 1, origin top-left.
+  function buildLines(p, tc) {
+    const T = p.vp1.transform, lines = [], weight = p.fw = new Map(), styles = tc.styles || {};
+    let cur = null;
+    const fits = (L, x0, base, fh) => L && Math.abs(base - L.base) <= Math.max(2, 0.25 * Math.min(fh, L.fh)) &&
+      x0 >= L.x1 - fh && x0 - L.x1 < Math.max(12, 1.5 * Math.max(fh, L.fh));
+    tc.items.forEach((it, k) => {
+      if (typeof it.str !== "string") return;
+      const tx = pdfjsLib.Util.transform(T, it.transform), fh = Math.hypot(tx[2], tx[3]);
+      if (!(tx[0] > 0) || Math.abs(tx[1]) > 0.02 * tx[0] || !fh) { if (it.hasEOL) cur = null; return; }  // rotated text
+      const str = it.str, x0 = tx[4], base = tx[5], x1 = x0 + it.width;
+      if (!str.trim()) { if (cur && str && !/\s$/.test(cur.text)) cur.text += " "; if (it.hasEOL) cur = null; return; }
+      const r = Math.round(fh * 2) / 2; weight.set(r, (weight.get(r) || 0) + str.length);
+      const mono = styles[it.fontName] && styles[it.fontName].fontFamily === "monospace" ? str.replace(/\s/g, "").length : 0;  // code listings
+      let L = fits(cur, x0, base, fh) ? cur : null;
+      const prev = lines[lines.length - 2];
+      if (!L && cur && cur === lines[lines.length - 1] && prev && cur.text.length <= 8 && cur.fh < 0.9 * prev.fh &&
+          cur.x0 >= prev.x1 - 1 && cur.x0 - prev.x1 < prev.fh && fits(prev, x0, base, fh)) {
+        // a superscript (citation or footnote mark) split the line: glue it back
+        prev.text += cur.text; prev.x1 = Math.max(prev.x1, cur.x1); prev.items.push(...cur.items); prev.mono += cur.mono; lines.pop(); L = prev;
+      }
+      if (L) {
+        if (x0 - L.x1 > 0.15 * fh && !/\s$/.test(L.text) && !/^\s/.test(str)) L.text += " ";
+        L.text += str; L.x1 = Math.max(L.x1, x1); L.fh = Math.max(L.fh, fh); L.items.push(k); L.mono += mono;
+      } else { L = { text: str, x0, x1, base, fh, items: [k], mono }; lines.push(L); }
+      cur = it.hasEOL ? null : L;
+    });
+    let long = 0, right = 0;
+    for (const L of lines) {
+      L.norm = L.text.normalize("NFKC").replace(/\s+/g, " ").trim();
+      L.top = L.base - 0.8 * L.fh; L.bottom = L.base + 0.22 * L.fh;
+      L.code = L.mono > 0.5 * L.text.replace(/\s/g, "").length;
+      if (L.norm.length > 30) { long++; if (L.x0 > 0.48 * p.bw) right++; }
+    }
+    p.twoCol = long > 10 && right > 0.25 * long;
+    return lines;
+  }
+  async function pageLines(p) {
+    if (!p.lines) { const tc = await textContent(p); p.lines = p.lines || buildLines(p, tc); }
+    return p.lines;
+  }
+  // Body font size = the size with the most characters in prose lines (long, not monospace) of the first pages.
+  // Fixed before any find so results don't depend on call order, and an appendix full of 7pt code listings
+  // (one test paper) can't make the 7pt listing size "the body".
+  let docBodyFh = 0, bodyP = null;
+  function bodyFh() {
+    return bodyP || (bodyP = Promise.all(pgs.slice(0, 6).map(pageLines)).then((first) => {
+      const w = new Map(); let best = 0, fh = 0;
+      for (const lines of first) for (const L of lines) {
+        if (L.norm.length <= 30 || L.code) continue;
+        const k = Math.round(L.fh * 2) / 2; w.set(k, (w.get(k) || 0) + L.norm.length);
+      }
+      if (!w.size) for (const p of pgs.slice(0, 6)) for (const [k, v] of p.fw || []) w.set(k, (w.get(k) || 0) + v);  // no prose (slides)
+      for (const [k, v] of w) if (v > best) { best = v; fh = k; }
+      return (docBodyFh = fh);
+    }).catch(() => 0));
+  }
+  async function allLines() {
+    const all = await Promise.all(pgs.map(pageLines));
+    await bodyFh();
+    return all;
+  }
+  // running heads/feet: text near the top of a page repeated on 3+ pages (digits stripped: page numbers differ)
+  const headKey = (s) => s.replace(/[\d\s.,*†‡§•|·]+/g, "").toLowerCase();
+  let headKeysCache = null;
+  function runningKeys(all) {
+    if (headKeysCache) return headKeysCache;
+    const n = new Map();
+    all.forEach((lines, pi) => {
+      const seen = new Set();
+      for (const L of lines) if (L.top <= 0.1 * pgs[pi].bh) { const k = headKey(L.norm); if (k.length >= 6) seen.add(k); }
+      for (const k of seen) n.set(k, (n.get(k) || 0) + 1);
+    });
+    return (headKeysCache = new Set([...n].filter(([, c]) => c >= 3).map(([k]) => k)));
+  }
+  const lineRect = (L) => [L.x0, L.top, L.x1, L.bottom];
+  const union = (a, b) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])];
+
+  // ================= find =================
+  function captionRes(kind, label) {
+    const w = kind === "table" ? "(?:table|tab\\.)" : kind === "algorithm" ? "(?:algorithm|alg\\.)" : "(?:figure|fig\\.)";
+    const L = label == null ? "[a-z]?\\d+(?:\\.\\d+)*[a-z]?" : esc(label), end = "(?![0-9a-z]|\\.\\d)";
+    return {
+      // an algorithm box title is often "Algorithm 1 Name" with no colon
+      cap: new RegExp(`^${w}\\s*${L}${end}` + (kind === "algorithm" ? "" : "\\s*[:.|—–]"), "i"),
+      alone: new RegExp(`^${w}\\s*${L}${end}\\s*$`, "i"),
+      mention: new RegExp(`\\b${w}\\s*${L}${end}`, "i"),
+    };
+  }
+  const tagRe = (label) => new RegExp(`^\\(\\s*${esc(label)}\\s*\\)$`);
+  // "Figure 3. The results…" at the start of a wrapped sentence is running text, not a caption
+  function looksWrapped(lines, j) {
+    const L = lines[j], P = lines[j - 1];
+    return !!P && Math.abs(P.fh - L.fh) < 0.5 && L.base > P.base && L.base - P.base < 1.6 * L.fh &&
+      Math.abs(P.x0 - L.x0) < 3 && !/[.:!?)]$/.test(P.norm);
+  }
+  function headingText(lines, j, label) {
+    const L = lines[j], re = new RegExp(`^${esc(label)}\\.?\\s+(\\S)`, "u");
+    let text = L.norm, m = re.exec(text);
+    if (!m) {  // number and title on one baseline but split by a wide gap
+      const n = lines[j + 1];
+      if (!n || !new RegExp(`^${esc(label)}\\.?$`).test(text) || Math.abs(n.base - L.base) > 2 || n.x0 < L.x1) return null;
+      text += " " + n.norm; m = re.exec(text);
+      if (!m) return null;
+    }
+    return /\p{Lu}/u.test(m[1]) ? text : null;
+  }
+  function headingScore(lines, j, label) {
+    const text = headingText(lines, j, label), L = lines[j];
+    if (!text || L.code) return 0;  // a numbered line of a code listing
+    if (/^\d+$/.test(label)) {  // "98 …", "99 …", "100 …" one under another: numbered listing lines, not a heading
+      const n = +label, nb = new RegExp(`^(?:${n - 1}|${n + 1})(?![\\d.])`);
+      for (const M of [lines[j - 2], lines[j - 1], lines[j + 1], lines[j + 2]]) {
+        if (M && Math.abs(M.base - L.base) > 0.5 && Math.abs(M.base - L.base) < 2.5 * L.fh && Math.abs(M.x0 - L.x0) < 3 && nb.test(M.norm)) return 0;
+      }
+    }
+    const r = L.fh / (docBodyFh || L.fh);
+    if (r > 1.75 || r < 0.85) return 0;  // a title, or a label inside a figure
+    let s = 10 + (r >= 1.1 ? 3 : 0) + (text.length <= 60 ? 2 : text.length <= 100 ? 0 : -6);
+    if (/(\.\s?){4,}/.test(text)) s -= 5;  // table-of-contents line with dot leaders
+    return s;
+  }
+  // The whole float a caption (lines[j]) belongs to, in page units: column-wide, with every caption line, reaching to
+  // the nearest boundary in the column — a full-size body line (short or small-type lines are labels/cells) or, below,
+  // a heading. Figures sit above their caption; a table/algorithm sits on whichever side its nearest line is clearly
+  // closer (Mixtral puts table captions below the table, SCALE above).
+  // The caption's own lines: same size, starting at the caption's left edge, one item per row (several items on one
+  // baseline are table cells), and only while the line before was full width (a short line ends the paragraph).
+  // follow() would run on into a table set in the caption's font (SCALE Table 2).
+  function captionBlock(lines, j) {
+    const C = lines[j], out = [C];
+    // the items on a line's baseline within the caption's width: inline math (a fraction, a sub/superscript) splits one
+    // caption line into a few pieces close together, while table cells sit apart (SCALE Table 2 header, Mixtral Table 5)
+    const rowOf = (L) => lines.filter((M) => Math.abs(M.base - L.base) < 1.5 && !(M.x1 < C.x0 - 5 || M.x0 > C.x1 + 5)).sort((a, b) => a.x0 - b.x0);
+    const span = (row) => Math.max(...row.map((M) => M.x1)) - row[0].x0;
+    const w0 = span(rowOf(C));
+    let prev = C, prevW = w0;
+    for (let k = j + 1; k < lines.length && out.length < 24; k++) {
+      const L = lines[k], dy = L.base - prev.base;
+      if (Math.abs(dy) < 1.5 || L.fh < 0.85 * C.fh) continue;  // another item on the row just taken; a sub/superscript or fraction part
+      if (dy < 0.5 * L.fh || dy > 1.8 * Math.max(L.fh, prev.fh) || Math.abs(L.fh - C.fh) > 0.6) break;
+      if (L.x1 < C.x0 - 5 || L.x0 > C.x1 + 5) continue;  // other column
+      const row = rowOf(L);
+      if (Math.abs(row[0].x0 - C.x0) > 2 * C.fh) break;   // not a continuation (e.g. a centred table header)
+      if (prevW < 0.8 * w0) break;                          // previous line was the caption's last
+      if (row.some((M, i) => i && M.x0 - row[i - 1].x1 > 2 * C.fh)) break;  // cells: wide gaps on one row
+      for (const M of row) if (!out.includes(M)) out.push(M);
+      prev = L; prevW = span(row);
+    }
+    const top = Math.min(...out.map((M) => M.top)), bot = Math.max(...out.map((M) => M.bottom));
+    for (const M of lines) if (M.fh < 0.85 * C.fh && !out.includes(M) && M.base > top && M.top < bot + 0.3 * C.fh && !(M.x1 < C.x0 - 5 || M.x0 > C.x1 + 5)) out.push(M);
+    return out;
+  }
+  const OTHER_CAP = /^(?:(?:table|tab\.|figure|fig\.)\s*[a-z]?\d+(?:\.\d+)*[a-z]?(?![0-9a-z]|\.\d)\s*[:.|—–]|(?:algorithm|alg\.)\s*\d+(?![0-9a-z]|\.\d))/i;
+  const HEADING_RE = /^(?:\d+(?:\.\d+)*\.?\s+\p{Lu}|[A-Z](?:\.\d+)*\.?\s+\p{Lu}|(?:Abstract|References|Bibliography|Acknowledg|Appendix|Conclusions?|Introduction|Related Work|Discussion|Limitations)\b)/u;
+  function floatBox(p, lines, j, kind) {
+    const C = lines[j], body = docBodyFh || C.fh, cap = captionBlock(lines, j);
+    const r = cap.map(lineRect).reduce(union);
+    const long = lines.filter((L) => L.norm.length > 30), mid = p.bw / 2;
+    const minX = long.length ? Math.min(...long.map((L) => L.x0)) : 0.08 * p.bw, maxX = long.length ? Math.max(...long.map((L) => L.x1)) : 0.92 * p.bw;
+    let x0 = minX, x1 = maxX;
+    if (p.twoCol && C.x1 < mid + 10) x1 = mid - 4;        // left column
+    else if (p.twoCol && C.x0 > mid - 10) x0 = mid + 4;   // right column
+    // wrapfigure/wraptable: body text runs beside the caption on its baselines → the float spans only the caption's side
+    const beside = lines.filter((L) => !cap.includes(L) && L.norm.length >= 15 && cap.some((c) => Math.abs(c.base - L.base) < 0.6 * c.fh));
+    const toR = beside.filter((L) => L.x0 > r[2] + 4), toL = beside.filter((L) => L.x1 < r[0] - 4);
+    if (toR.length) x1 = Math.min(x1, Math.min(...toR.map((L) => L.x0)) - 8);
+    if (toL.length) x0 = Math.max(x0, Math.max(...toL.map((L) => L.x1)) + 8);
+    x0 = Math.min(x0, r[0]); x1 = Math.max(x1, r[2]);
+    // Boundaries: body text — full size, from a column's left edge, at least about half a column wide (table rows and
+    // sub-headers glued into one long line start mid-column or are narrow; algorithm lines are numbered or keywords) —
+    // or a heading (bigger than the caption, or body size after a gap). A paragraph's short last line above the float
+    // stays outside with its paragraph.
+    const rightX = p.twoCol ? Math.min(Infinity, ...long.filter((L) => L.x0 > 0.48 * p.bw).map((L) => L.x0)) : Infinity;
+    const lefts = [x0, minX, rightX].filter(Number.isFinite), colW = p.twoCol ? (maxX - minX) / 2 : maxX - minX;
+    const near = lines.filter((L) => !cap.includes(L) && !(L.x1 < x0 - 5 || L.x0 > x1 + 5)).sort((a, b) => a.top - b.top);
+    // another float's caption ends the float next to it (figures stacked on a float page: one test paper's Fig. 10–14, Mixtral Table 2 → Figure 3)
+    const otherCaps = near.filter((L) => OTHER_CAP.test(L.norm) && !looksWrapped(lines, lines.indexOf(L))).map((L) => {
+      const b = captionBlock(lines, lines.indexOf(L)).map(lineRect).reduce(union);
+      return b;
+    });
+    const atLeft = (L, k = 3) => lefts.some((e) => Math.abs(L.x0 - e) <= k * L.fh);
+    const ALGO_LINE = /^(?:\d+:|input|output|require|ensure|procedure|function|for|while|if|else|repeat|until|return|end)\b/i;
+    // above: also a slightly smaller, indented block (page 1 abstract); below: full body size only (table notes and
+    // \small algorithm lines under a caption are part of the float)
+    const prose = (L, up) => !L.code && L.norm.length >= 40 && L.fh >= (up ? 0.85 : 0.95) * body && atLeft(L, up ? 4.5 : 3) &&
+      L.x1 - L.x0 >= 0.55 * colW && !(kind === "algorithm" && ALGO_LINE.test(L.norm));
+    const titleBlock = (L) => p.i === 0 && L.fh >= 1.15 * body && L.norm.length >= 8;  // page 1: title and author lines
+    const gapAbove = (L) => L.top - Math.max(0, ...near.filter((M) => M !== L && M.bottom <= L.top + 1).map((M) => M.bottom));
+    const heading = (L) => L.norm.length <= 80 && HEADING_RE.test(L.norm) && atLeft(L) &&
+      (L.fh >= 1.05 * Math.min(body, C.fh) || (L.fh >= 0.95 * body && gapAbove(L) >= 1.2 * L.fh));
+    const para = (A, B) => atLeft(A) && atLeft(B) && Math.abs(A.fh - B.fh) < 0.3 && B.top - A.bottom <= 0.45 * A.fh;  // B follows A in one paragraph
+    let upL = null, dnL = null, gapUp = Infinity, gapDn = Infinity;
+    for (const L of near) {
+      if (L.bottom <= r[1] + 1) {
+        gapUp = Math.min(gapUp, r[1] - L.bottom);
+        if ((prose(L, true) || heading(L) || titleBlock(L)) && (!upL || L.bottom > upL.bottom)) upL = L;
+      } else if (L.top >= r[3] - 1) {
+        gapDn = Math.min(gapDn, L.top - r[3]);
+        if ((prose(L, false) || heading(L)) && (!dnL || L.top < dnL.top)) dnL = L;
+      }
+    }
+    if (upL) for (let k = near.indexOf(upL) + 1, prev = upL; k < near.length && near[k].bottom <= r[1] + 1; k++) {
+      if (Math.abs(near[k].base - prev.base) < 1.5) continue;
+      if (!para(prev, near[k])) break;
+      upL = prev = near[k];
+    }
+    let up = upL ? upL.bottom + 2 : 0.04 * p.bh, dn = dnL ? dnL.top - 2 : 0.96 * p.bh;
+    for (const b of otherCaps) {
+      if (b[3] <= r[1] + 1) up = Math.max(up, b[3] + 2);
+      else if (b[1] >= r[3] - 1) dn = Math.min(dn, b[1] - 2);
+    }
+    // the side the float is on: figures above, a table/algorithm on its clearly nearer side — but a side with nothing
+    // between the caption and the next boundary can't hold it (Mixtral Table 3 sits above although body text is nearer)
+    // and a side holding no line at all while the other side holds the float's rows can't be it (Mixtral Table 5: the
+    // caption's nearer side is the white space before the next paragraph)
+    const minExt = 1.5 * C.fh, extUp = r[1] - up, extDn = dn - r[3];
+    const rowsIn = (a, b) => near.filter((L) => L.top >= a - 1 && L.bottom <= b + 1).length;
+    const nUp = rowsIn(up, r[1]), nDn = rowsIn(r[3], dn);
+    let above = kind === "figure" || gapUp < 0.7 * gapDn;
+    if ((above ? extUp : extDn) < minExt) {
+      if ((above ? extDn : extUp) < minExt) return null;  // caption only: nothing to cut out
+      above = !above;
+    } else if (kind !== "figure" && (above ? nUp : nDn) === 0 && (above ? nDn : nUp) >= 2 && (above ? extDn : extUp) >= minExt) above = !above;
+    return above ? [x0, up, x1, Math.min(dn, r[3] + 4)] : [x0, Math.max(up, r[1] - 4), x1, dn];
+  }
+  function eqRect(p, lines, j) {
+    const T = lines[j], colL = p.twoCol && T.x0 > 0.55 * p.bw ? 0.48 * p.bw : 0;
+    let r = lineRect(T), wide = false;
+    for (const L of lines) {
+      if (L === T || L.x1 > T.x0 + 1 || L.x0 < colL || Math.abs(L.base - T.base) > 2.5) continue;
+      r = union(r, lineRect(L)); wide = true;
+    }
+    if (!wide) r[0] = Math.max(colL + 0.06 * p.bw, T.x0 - 0.4 * p.bw);  // body not on the tag's baseline: a band
+    return [r[0], r[1] - 0.3 * T.fh, r[2], r[3] + 0.3 * T.fh];
+  }
+  function target(kind, pi, lines, j, ok) {
+    const p = pgs[pi], L = lines[j];
+    let rect = lineRect(L), focus = null;
+    if (kind === "section") { const n = lines[j + 1]; if (n && Math.abs(n.base - L.base) < 2 && n.x0 > L.x1) rect = union(rect, lineRect(n)); }
+    if (kind === "equation") rect = eqRect(p, lines, j);
+    if (kind === "figure" || kind === "table" || kind === "algorithm") focus = floatBox(p, lines, j, kind);
+    return { ok, pi, rects: [rect], focus };
+  }
+  // named destinations (hyperref: table.N, figure.N, subsection.4.2, equation.N, appendix.A) — verified on their page
+  let destsP = null;
+  async function byDest(kind, label) {
+    const all = await (destsP || (destsP = pdf.getDestinations().catch(() => ({}))));
+    const depth = label.split(".").length;
+    const pre = kind === "algorithm" ? ["algorithm", "algocf", "alg"] : kind !== "section" ? [kind] : [...new Set(["section", "subsection", "subsubsection"].slice(depth - 1)
+      .concat(["section", "subsection", "subsubsection", "appendix", "chapter", "paragraph"]))];
+    for (const pr of pre) {
+      const arr = all && all[pr + "." + label];
+      const d = arr && await resolveDest(arr);
+      if (!d) continue;
+      const lines = await pageLines(pgs[d.i]);
+      let best = -1, bd = Infinity;
+      lines.forEach((L, j) => {
+        const dy = L.base - d.y;
+        let ok = false, cost = Math.abs(dy);
+        if (kind === "table" || kind === "figure" || kind === "algorithm") { const re = captionRes(kind, label); ok = re.cap.test(L.norm) || re.alone.test(L.norm); if (dy < -10) cost += 1000; }
+        else if (kind === "section") ok = Math.abs(dy) < 80 && headingText(lines, j, label) != null;
+        else ok = dy > -40 && dy < 200 && tagRe(label).test(L.norm);
+        if (ok && cost < bd) { bd = cost; best = j; }
+      });
+      if (best >= 0) return target(kind, d.i, lines, best, true);
+      const j = lineAt(lines, d);  // the name exists but its text didn't verify: keep it as a fallback
+      return { ok: false, pi: d.i, rects: [j >= 0 ? lineRect(lines[j]) : [0.08 * pgs[d.i].bw, d.y, 0.92 * pgs[d.i].bw, d.y + 14]], focus: null };
+    }
+    return null;
+  }
+  // near = page index of a named destination that exists but didn't verify: hyperref often drops the anchor at the
+  // bottom of the page before the heading, so candidates on that page or the next one win ties (2611 §4.2·§G, 2606 §6)
+  async function byText(kind, label, near = null) {
+    const all = await allLines();
+    let best = null;
+    const consider = (s, pi, j) => {
+      if (s > 0 && near != null && (pi === near || pi === near + 1)) s += 5;
+      if (s > (best ? best.s : 0)) best = { s, pi, j };
+    };
+    if (kind === "table" || kind === "figure" || kind === "algorithm") {
+      // caption lines only: falling back to the first mention in the text was right 4/23 times in the experiments,
+      // so a table/figure without a recognisable caption counts as "not found" (the answer's link is then removed)
+      const re = captionRes(kind, label);
+      all.forEach((lines, pi) => lines.forEach((L, j) => {
+        consider(re.cap.test(L.norm) ? (looksWrapped(lines, j) ? 1.5 : 3) : re.alone.test(L.norm) ? 2 : 0, pi, j);
+      }));
+      return best && target(kind, best.pi, all[best.pi], best.j, true);
+    }
+    if (kind === "section") {
+      const keys = runningKeys(all);  // "12" + "Zhang et al." on a running head's baseline reads like heading 12
+      all.forEach((lines, pi) => lines.forEach((L, j) => {
+        let s = headingScore(lines, j, label);
+        if (s && L.top <= 0.1 * pgs[pi].bh && keys.has(headKey(headingText(lines, j, label)))) s = 0;
+        consider(s, pi, j);
+      }));
+      return best && target(kind, best.pi, all[best.pi], best.j, true);
+    }
+    if (kind === "equation") {
+      const re = tagRe(label);
+      all.forEach((lines, pi) => lines.forEach((L, j) => {
+        const P = lines[j - 1], header = P && Math.abs(P.base - L.base) < 2 && /^\(\s*\d+\s*\)$/.test(P.norm);  // "(1) (2) (3)" table header
+        if (re.test(L.norm) && !header) consider(2, pi, j);
+      }));
+      return best && target(kind, best.pi, all[best.pi], best.j, true);   // only the "(N)" tag itself, not a mention
+    }
+    return null;
+  }
+  // 'text': case- and whitespace-insensitive; a second pass also ignores hyphens (line-break hyphenation)
+  const normText = (s) => s.normalize("NFKC").toLowerCase().replace(/[‘’′`]/g, "'").replace(/[“”″]/g, '"').replace(/[‐‑‒–—−]/g, "-").replace(/\s+/g, "");
+  function pageChars(p, tc, noHy) {
+    const key = noHy ? "chH" : "ch";
+    if (p[key]) return p[key];
+    const parts = [], mi = [], mo = [];  // per code unit of the joined string: item index, offset in item.str
+    tc.items.forEach((it, i) => {
+      if (!it.str) return;
+      let o = 0;
+      for (const c of it.str) {
+        const code = c.charCodeAt(0);
+        let n = code >= 128 ? normText(c) : code <= 32 ? "" : code >= 65 && code <= 90 ? c.toLowerCase() : c === "`" ? "'" : c;  // ASCII fast path
+        if (noHy) n = n.replace(/-/g, "");
+        for (let u = 0; u < n.length; u++) { mi.push(i); mo.push(o); }
+        if (n) parts.push(n);
+        o += c.length;
+      }
+    });
+    return (p[key] = { s: parts.join(""), mi, mo });
+  }
+  function itemBox(p, it) {
+    const tx = pdfjsLib.Util.transform(p.vp1.transform, it.transform), fh = Math.hypot(tx[2], tx[3]);
+    const a = Math.atan2(tx[1], tx[0]), c = Math.cos(a), s = Math.sin(a), w = it.width;
+    const xs = [], ys = [];
+    for (const [u, v] of [[0, -0.8 * fh], [0, 0.22 * fh], [w, -0.8 * fh], [w, 0.22 * fh]]) { xs.push(tx[4] + u * c - v * s); ys.push(tx[5] + u * s + v * c); }
+    return { horiz: Math.abs(a) < 0.02, x0: tx[4], w, base: tx[5], fh, box: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)] };
+  }
+  function charRects(p, tc, ch, k, n) {
+    const i0 = ch.mi[k], i1 = ch.mi[k + n - 1], rects = [];
+    for (let i = i0; i <= i1; i++) {
+      const it = tc.items[i];
+      if (!it || !it.str) continue;
+      const g = itemBox(p, it), len = it.str.length;
+      let r = g.box;
+      if (g.horiz) {  // characters assumed evenly spaced within an item
+        const s = i === i0 ? ch.mo[k] : 0, e = i === i1 ? ch.mo[k + n - 1] + 1 : len;
+        r = [g.x0 + g.w * s / len, g.box[1], g.x0 + g.w * Math.min(e, len) / len, g.box[3]];
+      }
+      const last = rects[rects.length - 1];
+      if (last && Math.abs(last.base - g.base) < 2 && r[0] - last[2] < 2 * g.fh) { last[0] = Math.min(last[0], r[0]); last[1] = Math.min(last[1], r[1]); last[2] = Math.max(last[2], r[2]); last[3] = Math.max(last[3], r[3]); }
+      else { r = r.slice(); r.base = g.base; rects.push(r); }
+    }
+    return rects;
+  }
+  async function findText(q) {
+    const needle = normText(q);
+    if (!needle) return false;
+    const tcs = await Promise.all(pgs.map(textContent));
+    // the whole string; then ignoring hyphens ("experi-\nments" matches "experiments"); then, for a long quote
+    // (e.g. copied from an answer, whose tail may differ from the PDF), its first 60 characters
+    const tries = [[needle, false], [needle, true]];
+    if (needle.length > 80) tries.push([needle.slice(0, 60), false], [needle.slice(0, 60), true]);
+    for (const [q0, noHy] of tries) {
+      const nd = noHy ? q0.replace(/-/g, "") : q0;
+      if (!nd) continue;
+      for (const p of pgs) {
+        const ch = pageChars(p, tcs[p.i], noHy), k = ch.s.indexOf(nd);
+        if (k >= 0) { showTarget({ pi: p.i, rects: charRects(p, tcs[p.i], ch, k, nd.length), focus: null }); return true; }
+      }
+    }
+    return false;
+  }
+  // where a table/figure/section/equation/algorithm is, without moving (null if not in this paper)
+  const locCache = new Map();
+  async function locate(kind, label) {
+    try { await ready; } catch (e) { return null; }
+    kind = String(kind || "").toLowerCase().trim();
+    label = String(label ?? "").trim();
+    if (!["table", "figure", "section", "equation", "algorithm"].includes(kind)) return null;
+    label = label.replace(/^(?:table|tab\.?|figure|fig\.?|section|sec\.?|§|appendix|equation|eqn?\.?|algorithm|alg\.?)\s*/i, "")
+      .replace(/^[(\[]\s*|\s*[)\]]$/g, "").replace(/[.:]$/, "").trim();
+    if (!label) return null;
+    const key = kind + ":" + label;
+    if (!locCache.has(key)) locCache.set(key, (async () => {
+      await bodyFh();  // float extents and heading scores use it: same answer whatever was looked up first
+      let t = await byDest(kind, label);
+      if (!t || !t.ok) t = await byText(kind, label, t ? t.pi : null);   // an unverified destination only hints where to look
+      return t || null;
+    })().catch(() => null));
+    return locCache.get(key);
+  }
+  async function find(kind, label) {
+    try { await ready; } catch (e) { return false; }
+    const k = String(kind || "").toLowerCase().trim(), l = String(label ?? "").trim();
+    if (k === "page") { const n = parseInt(l, 10); return n >= 1 && n <= pgs.length ? (pushBack(), goto(n, 0)) : false; }
+    if (k === "text") return findText(l);
+    const t = await locate(k, l);
+    if (!t) return false;
+    showTarget(t, k);
+    return true;
+  }
+  function showTarget(t, kind) {
+    pushBack();
+    const p = pgs[t.pi], s = p.scale, H = vh(), f = t.focus || t.rects[0];
+    const y0 = tops[t.pi] + f[1] * s, y1 = tops[t.pi] + f[3] * s;
+    let sy;
+    if (y1 - y0 <= 0.9 * H) sy = (y0 + y1) / 2 - H / 2;  // centered
+    else if (kind === "figure") sy = y1 - 0.88 * H;   // tall figure: keep its caption in view
+    else sy = y0 - 0.08 * H;
+    let sx = scrollX;
+    if (p.W > vw()) { const r = t.rects[0]; sx = p.div.offsetLeft + (r[0] + r[2]) / 2 * s - vw() / 2; }
+    scrollTo(Math.max(0, sx), Math.max(0, sy));
+    updateCurrent();
+    flash(t.pi, t.rects);
+  }
+  function flash(pi, rects) {
+    const p = pgs[pi];
+    for (const r of rects.slice(0, 30)) {
+      const d = document.createElement("div");
+      d.className = "pr-flash";  // percentages: stays in place if the zoom changes meanwhile
+      d.style.cssText = `left:${pct(r[0] - 2, p.bw)};top:${pct(r[1] - 2, p.bh)};width:${pct(r[2] - r[0] + 4, p.bw)};height:${pct(r[3] - r[1] + 4, p.bh)}`;
+      p.div.appendChild(d);
+      setTimeout(() => d.remove(), 1700);
+    }
+  }
+
+  // ================= destinations, links, preview card =================
+  const pageIdx = new Map();
+  async function resolveDest(dest) {
+    const name = typeof dest === "string" ? dest : null;
+    const arr = name ? await pdf.getDestination(name).catch(() => null) : dest;
+    if (!Array.isArray(arr) || !arr.length) return null;
+    let i = null;
+    if (Number.isInteger(arr[0])) i = arr[0];
+    else if (arr[0] && typeof arr[0] === "object") {
+      const k = arr[0].num + "R" + arr[0].gen;
+      if (!pageIdx.has(k)) pageIdx.set(k, pdf.getPageIndex(arr[0]).catch(() => null));
+      i = await pageIdx.get(k);
+    }
+    if (i == null || i < 0 || i >= pgs.length) return null;
+    const p = pgs[i], mode = arr[1] && arr[1].name;
+    let x = null, y = null;
+    if (mode === "XYZ") { x = arr[2]; y = arr[3]; }
+    else if (mode === "FitH" || mode === "FitBH") y = arr[2];
+    else if (mode === "FitV" || mode === "FitBV") x = arr[2];
+    else if (mode === "FitR") { x = arr[2]; y = arr[5]; }
+    const vb = p.vp1.viewBox, pt = p.vp1.convertToViewportPoint(x ?? vb[0], y ?? vb[3]);
+    return { name, i, page: i + 1, x: x == null ? null : clamp(pt[0], 0, p.bw), y: y == null ? 0 : clamp(pt[1], 0, p.bh) };
+  }
+  const linkDest = new WeakMap();
+  async function buildLinks(p) {
+    let list;
+    try { list = await p.proxy.getAnnotations({ intent: "display" }); } catch (e) { return; }
+    list = list.filter((a) => a.subtype === "Link" && !(a.annotationFlags & 2) && (a.url || a.dest));
+    if (!list.length) return;
+    const layer = document.createElement("div");
+    layer.className = "prLinks";
+    for (const a of list) {
+      const r = p.vp1.convertToViewportRectangle(a.rect);
+      const x0 = Math.min(r[0], r[2]), x1 = Math.max(r[0], r[2]), y0 = Math.min(r[1], r[3]), y1 = Math.max(r[1], r[3]);
+      const el = document.createElement("a");
+      el.style.cssText = `left:${pct(x0, p.bw)};top:${pct(y0, p.bh)};width:${pct(x1 - x0, p.bw)};height:${pct(y1 - y0, p.bh)}`;
+      if (a.url) {  // pdf.js only fills `url` for safe protocols
+        el.href = a.url; el.target = "_blank"; el.rel = "noopener noreferrer";
+        el.addEventListener("click", (e) => { e.preventDefault(); window.open(a.url, "_blank", "noopener"); });
+      } else {
+        linkDest.set(el, a.dest);
+        el.addEventListener("click", onLinkClick);
+        el.addEventListener("mouseenter", onLinkEnter);
+        el.addEventListener("mouseleave", onLinkLeave);
+      }
+      layer.appendChild(el);
+    }
+    p.div.appendChild(layer);
+  }
+  async function onLinkClick(e) {
+    e.preventDefault();
+    const dest = linkDest.get(e.currentTarget);
+    hideCard();
+    const d = await resolveDest(dest).catch(() => null);
+    if (d) jumpToDest(d);
+  }
+  async function jumpToDest(d, info) {
+    pushBack();
+    const p = pgs[d.i];
+    let x = scrollX;
+    if (d.x != null && p.W > vw()) x = p.div.offsetLeft + d.x * p.scale - 24;  // zoomed in: bring the target column into view
+    scrollTo(Math.max(0, x), Math.max(0, tops[d.i] + d.y * p.scale - 24));
+    updateCurrent();
+    info = info || await destInfo(d).catch(() => null);
+    if (info && info.rect) flash(d.i, [info.rect]);
+  }
+  // first line at/below a destination point, in the destination's column
+  function lineAt(lines, d) {
+    let best = -1, bd = Infinity;
+    lines.forEach((L, j) => {
+      const dy = L.base - d.y;
+      if (dy < 0.2 * L.fh) return;
+      if (d.x != null && d.x > 1 && (L.x1 < d.x - 2 || L.x0 > d.x + 120)) return;
+      if (dy < bd) { bd = dy; best = j; }
+    });
+    return best;
+  }
+  function captionNear(lines, kind, label, y) {
+    const re = captionRes(kind, label);
+    let best = -1, bd = Infinity;
+    lines.forEach((L, j) => {
+      if (!re.cap.test(L.norm) && !re.alone.test(L.norm)) return;
+      const dy = L.base - y, cost = dy >= -10 ? dy : 1000 - dy;
+      if (cost < bd) { bd = cost; best = j; }
+    });
+    return best;
+  }
+  // a block of lines going down from lines[i0]; ref mode stops at the next bibliography entry
+  function follow(lines, i0, { max = 6, chars = 500, ref = false, firstGap = 0 } = {}) {
+    const L0 = lines[i0], out = [L0];
+    const numbered = /^\[[^\]]{1,10}\]/.test(L0.norm), dotted = /^\d{1,3}\.\s/.test(L0.norm);
+    let prev = L0, rows = 1, len = L0.norm.length, step = 0, hang = null, xl = L0.x0, xr = L0.x1, jumped = false;
+    for (let j = i0 + 1; j < lines.length && len < chars; j++) {
+      const L = lines[j], dy = L.base - prev.base, fh = Math.max(L.fh, prev.fh);
+      if (Math.abs(dy) <= Math.max(2, 0.45 * fh) && L.x0 >= prev.x1 - 2 && L.x0 - prev.x1 < 4 * fh) {  // same row (wide gap or after a superscript)
+        out.push(L); prev = L; xr = Math.max(xr, L.x1); len += L.norm.length; continue;
+      }
+      if (ref && numbered && !jumped && rows < max && dy < -5 * fh && L.x0 > xr - 5 && !/^\[[^\]]{1,10}\]/.test(L.norm)) {
+        jumped = true; out.cut = out.length;  // a numbered entry continuing at the top of the next column
+        out.push(L); prev = L; rows++; xl = L.x0; xr = L.x1; len += L.norm.length; continue;
+      }
+      const gap = (rows === 1 && firstGap) || (ref ? 1.45 : 1.75);
+      if (rows >= max || dy < 0.5 * fh || dy > gap * fh || (step && dy > step * 1.15 + 0.5)) break;  // gap → block ends
+      if (L.x1 < xl - 2 || L.x0 > xr + 2) break;  // no horizontal overlap → another column
+      if (ref) {
+        if ((numbered && /^\[[^\]]{1,10}\]/.test(L.norm)) || (dotted && /^\d{1,3}\.\s/.test(L.norm))) break;  // next "[n]" entry
+        if (hang === null) hang = L.x0 > L0.x0 + 3;
+        else if (hang && !jumped && L.x0 < L0.x0 + 1.5) break;  // hanging indent ends → next entry
+      }
+      if (rows > 1 || !firstGap) step = step || dy;
+      out.push(L); prev = L; rows++; xl = Math.min(xl, L.x0); xr = Math.max(xr, L.x1); len += L.norm.length;
+    }
+    return out;
+  }
+  // the bibliography entry a cite anchor points at: anchors sit about one line above the entry's first line
+  async function refEntry(lines, d) {
+    let i0 = -1, bd = Infinity;
+    lines.forEach((L, j) => {
+      const dy = L.base - d.y;
+      if (dy < 0.5 * L.fh || dy > 3 * L.fh) return;
+      // another column: the entry starts at/right of the anchor (a right-column anchor in the gutter at x≈290 would
+      // otherwise also accept left-column lines ending at x≈295 — 16 of 25 wrong cards in one test paper)
+      if (d.x != null && (L.x0 < d.x - 2 || L.x0 > d.x + 40)) return;
+      if (dy < bd) { bd = dy; i0 = j; }
+    });
+    if (i0 < 0) return null;
+    const block = follow(lines, i0, { max: 8, chars: 500, ref: true });  // narrow columns need ~8 rows for 500 chars
+    // A numbered entry cut by the page end goes on at the top of the next page, indented like its own second row
+    // (lines before the next "[n]" there at that indent; a running header is skipped by the indent/size check).
+    const k = lines.indexOf(block[block.length - 1]), row2 = block.find((L) => L.base > block[0].base + 2);
+    if (/^\[[^\]]{1,10}\]/.test(block[0].norm) && row2 && block.length < 8 && d.i + 1 < pgs.length &&
+        lines.slice(k + 1).every((L) => /^\d{1,4}$/.test(L.norm))) {
+      const next = await pageLines(pgs[d.i + 1]), e = next.findIndex((L) => /^\[[^\]]{1,10}\]/.test(L.norm));
+      block.cut = block.cut ?? block.length;
+      if (e > 0) for (const L of next.slice(0, e)) if (Math.abs(L.x0 - next[e].x0 - (row2.x0 - block[0].x0)) < 2 && Math.abs(L.fh - block[0].fh) < 0.3) block.push(L);
+    }
+    return block;
+  }
+  const REFS_RE = /^(?:\d+\.?|[A-Z]\.|[IVX]+\.)?\s*(references|bibliography|literature cited|works cited|참고\s*문헌)$/i;
+  const NOT_CITE = /^(section|subsection|subsubsection|paragraph|subparagraph|chapter|part|appendix|figure|table|equation|page|item|theorem|lemma|corollary|definition|proposition|remark|example|algorithm|algocf|alc@|lstlisting|listing|footnote|hfootnote|subfigure|subtable|caption|doc-start|noticebox|toc)/i;
+  async function inBibliography(d, lines) {
+    const j = lineAt(lines, d);
+    if (j >= 0 && /^\[[^\]]{1,10}\]/.test(lines[j].norm)) return true;
+    for (let i = d.i; i >= Math.max(0, d.i - 15); i--) {
+      const ls = i === d.i ? lines : await pageLines(pgs[i]);
+      if (ls.some((L) => REFS_RE.test(L.norm) && (i < d.i || L.base <= d.y + 2))) return true;
+    }
+    return false;
+  }
+  function blockText(block, max) {
+    let s = "";
+    for (const L of block) {
+      const t = L.norm, url = /:\/\/\S*$/.test(s) ? s.match(/\S*$/)[0] : "";
+      if (!s) s = t;
+      else if (/[A-Za-z]-$/.test(s) && /^\p{Ll}/u.test(t)) s = s.slice(0, -1) + t;  // re-join a hyphenated word
+      else if ((url && (/[/=_?&#%:-]$/.test(url) || (/[.\w]$/.test(url) && /^[\p{Ll}\d/]/u.test(t)))) || (/https?:$/.test(s) && /^\/\//.test(t))) s += t;  // a URL broken over lines
+      else s += " " + t;
+    }
+    return s.length > max ? s.slice(0, max).replace(/\s+\S*$/, "") + "…" : s;
+  }
+  async function destInfo(d) {
+    const lines = await pageLines(pgs[d.i]), name = d.name || "";
+    const fig = /^(figure|table)\.(.+)$/i.exec(name);
+    let cite = /^cite\./i.test(name);
+    if (!cite && !NOT_CITE.test(name)) cite = await inBibliography(d, lines);
+    let block = null;
+    if (cite) block = await refEntry(lines, d);
+    if (!block && fig) {
+      const j = captionNear(lines, fig[1].toLowerCase(), /^caption\./i.test(fig[2]) ? null : fig[2], d.y);
+      if (j >= 0) block = follow(lines, j, { max: 4, chars: 400 });
+    }
+    if (!block) { const j = lineAt(lines, d); if (j >= 0) block = follow(lines, j, { max: 3, chars: 300, firstGap: 3 }); }
+    const kind = cite ? "참고문헌" : fig ? (/^f/i.test(fig[1]) ? "그림" : "표") : /^(sub)*section\.|^appendix\./i.test(name) ? "절" : /^equation\./i.test(name) ? "식" : "";
+    const own = block && block.slice(0, block.cut);  // flash only the part in the first column of this page
+    return { cite, text: block ? blockText(block, cite ? 500 : 400) : "", rect: own ? own.map(lineRect).reduce(union) : null, head: (kind ? kind + " · " : "") + "p." + d.page };
+  }
+  let card = null, cardLink = null, showT = 0, hideT = 0, cardSeq = 0;
+  function onLinkEnter(e) {
+    const a = e.currentTarget;
+    clearTimeout(hideT);
+    if (e.buttons) return;  // dragging a text selection across a link
+    if (cardLink === a) return;
+    clearTimeout(showT);
+    showT = setTimeout(() => showCard(a), 250);
+  }
+  function onLinkLeave() { clearTimeout(showT); hideSoon(); }
+  function hideSoon() { clearTimeout(hideT); hideT = setTimeout(hideCard, 300); }  // grace period to reach the card
+  function hideCard() {
+    clearTimeout(showT); clearTimeout(hideT); cardSeq++;
+    if (card) { card.remove(); card = null; }
+    cardLink = null;
+  }
+  function parentOpenRef() {
+    try { return window.parent !== window && typeof window.parent.prOpenRef === "function"; } catch (e) { return false; }
+  }
+  function toParentRect(r) {  // the card's box in the parent window's viewport coordinates
+    let ox = 0, oy = 0;
+    try { const f = window.frameElement; if (f) { const b = f.getBoundingClientRect(); ox = b.left + f.clientLeft; oy = b.top + f.clientTop; } } catch (e) {}
+    return { left: r.left + ox, top: r.top + oy, right: r.right + ox, bottom: r.bottom + oy, width: r.width, height: r.height };
+  }
+  async function showCard(a) {
+    const seq = ++cardSeq;
+    let d = null, info = null;
+    try { d = await resolveDest(linkDest.get(a)); info = d && await destInfo(d); } catch (e) { return; }
+    if (!d || !info || seq !== cardSeq || !a.isConnected) return;
+    if (card) card.remove();
+    const el = card = document.createElement("div");
+    cardLink = a;
+    el.className = "pr-card";
+    el.innerHTML = '<div class="h"></div><div class="t"></div><div class="b"></div>';
+    el.querySelector(".h").textContent = info.head;
+    el.querySelector(".t").textContent = info.text || "미리 볼 글자를 찾지 못했습니다.";
+    const bar = el.querySelector(".b");
+    const button = (label, fn) => { const b = document.createElement("button"); b.type = "button"; b.textContent = label; b.addEventListener("click", fn); bar.appendChild(b); };
+    button("이동", () => { hideCard(); jumpToDest(d, info); });
+    if (info.cite && info.text && parentOpenRef()) {
+      button("논문 찾기", () => {
+        const r = toParentRect(el.getBoundingClientRect());
+        hideCard();
+        try { window.parent.prOpenRef(info.text, r); } catch (e) { console.warn(e); }
+      });
+    }
+    el.addEventListener("mouseenter", () => clearTimeout(hideT));
+    el.addEventListener("mouseleave", hideSoon);
+    document.body.appendChild(el);
+    window.dispatchEvent(new CustomEvent("pr-cite"));  // the parent only counts it (feature-use log)
+    const r = a.getBoundingClientRect(), w = el.offsetWidth, h = el.offsetHeight, W = vw(), H = vh();
+    let top = r.bottom + 6;
+    if (top + h > H - 8) top = r.top - 6 - h;  // no room below: above the link
+    el.style.top = clamp(top, 8, Math.max(8, H - h - 8)) + "px";
+    el.style.left = clamp(r.left, 8, Math.max(8, W - w - 8)) + "px";
+  }
+
+  // ================= position, events, API =================
+  let lastView = "", lastViewAt = 0, viewTimer = 0;
+  function emitView() {  // pr-view, at most every 120 ms, always with the final state
+    if (!isReady) return;
+    const key = curPage + "/" + pgs.length + "@" + zoom;
+    if (key === lastView) return;
+    const wait = lastViewAt + 120 - performance.now();
+    if (wait > 0) { if (!viewTimer) viewTimer = setTimeout(() => { viewTimer = 0; emitView(); }, wait); return; }
+    lastView = key; lastViewAt = performance.now();
+    window.dispatchEvent(new CustomEvent("pr-view", { detail: { page: curPage, pages: pgs.length, zoom } }));
+  }
+  function updateCurrent() {
+    if (!isReady) return;
+    curPage = pageAt(scrollY + vh() / 3) + 1;  // the page under the top third of the view
+    emitView();
+  }
+  function goto(page, yFrac = 0, opts = {}) {
+    if (!isReady) { ready.then(() => goto(page, yFrac, opts), () => {}); return false; }  // applied once laid out
+    const i = clamp(Math.round(+page) || 1, 1, pgs.length) - 1, p = pgs[i];
+    const y = tops[i] + clamp(+yFrac || 0, 0, 1) * p.H;
+    scrollTo({ left: scrollX, top: Math.max(0, opts && opts.center ? y - vh() / 2 : y), behavior: opts && opts.smooth ? "smooth" : "auto" });
+    updateCurrent();
+    return true;
+  }
+  function position() {  // the page at the top of the view and the fraction of it scrolled past
+    if (!isReady) return { page: 1, y: 0 };
+    const i = pageAt(scrollY), f = (scrollY - tops[i]) / pgs[i].H;
+    if (f > 1 && i + 1 < pgs.length) return { page: i + 2, y: 0 };  // in the gap below a page
+    return { page: i + 1, y: Math.round(clamp(f, 0, 1) * 1e4) / 1e4 };
+  }
+  // a sharp picture of a region of the view (this frame's viewport px): the page under it is drawn again at high resolution
+  async function capture(r) {
+    if (!isReady || !r) return null;
+    let best = null;
+    for (const p of pgs) {
+      const b = p.div.getBoundingClientRect();
+      const w = Math.min(r.right, b.right) - Math.max(r.left, b.left), h = Math.min(r.bottom, b.bottom) - Math.max(r.top, b.top);
+      if (w > 0 && h > 0 && (!best || w * h > best.a)) best = { p, a: w * h, x0: Math.max(r.left, b.left) - b.left, y0: Math.max(r.top, b.top) - b.top, w, h };
+    }
+    if (!best) return null;
+    const { p, x0, y0, w, h } = best;
+    const ux = x0 / p.scale, uy = y0 / p.scale, uw = w / p.scale, uh = h / p.scale;  // page units at scale 1
+    const dpr = devicePixelRatio || 1;   // never coarser than the screen (zoomed in on a detail), at most 3000 px a side
+    const s = Math.min(Math.max(2, 2 * dpr, p.scale * dpr), 3000 / uw, 3000 / uh);
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.round(uw * s)); cv.height = Math.max(1, Math.round(uh * s));
+    const ctx = cv.getContext("2d", { alpha: false });
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
+    await p.proxy.render({ canvasContext: ctx, viewport: p.proxy.getViewport({ scale: s }), transform: [1, 0, 0, 1, -ux * s, -uy * s] }).promise;
+    const url = cv.toDataURL("image/png");
+    cv.width = cv.height = 0;
+    return { data: url, page: p.n };
+  }
+
+  // running heads (author list, title) per page — a float at the top of a page stops below its own page's head
+  // (a paper and its supplement can have heads at different heights; pages without one aren't clipped)
+  let headP = null;
+  function runningHeadBottom() {
+    return headP || (headP = allLines().then((all) => {
+      const keys = runningKeys(all);
+      return all.map((lines, pi) => lines.reduce((b, L) => (L.top <= 0.1 * pgs[pi].bh && keys.has(headKey(L.norm)) ? Math.max(b, L.bottom) : b), 0));
+    }).catch(() => []));
+  }
+  // a table/figure/algorithm as a picture for the seminar packet: the whole float with its full caption, column-wide
+  // (null when only the caption could be found — the parent then reports it instead of saving a caption strip)
+  async function snapshot(kind, label) {
+    const t = await locate(kind, label);
+    if (!t || !t.focus || !["table", "figure", "algorithm"].includes(String(kind).toLowerCase())) return null;
+    const p = pgs[t.pi], f = t.focus, head = (await runningHeadBottom())[t.pi] || 0;   // floatBox stops at neighbouring lines: pad only sideways
+    const r = [Math.max(0, f[0] - 6), Math.max(0, f[1], head && head < f[3] ? head + 3 : 0), Math.min(p.bw, f[2] + 6), Math.min(p.bh, f[3])];
+    const uw = r[2] - r[0], uh = r[3] - r[1], s = Math.min(4, 2400 / uw, 3000 / uh);
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.round(uw * s)); cv.height = Math.max(1, Math.round(uh * s));
+    const ctx = cv.getContext("2d", { alpha: false });
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
+    await p.proxy.render({ canvasContext: ctx, viewport: p.proxy.getViewport({ scale: s }), transform: [1, 0, 0, 1, -r[0] * s, -r[1] * s] }).promise;
+    const data = cv.toDataURL("image/png");
+    cv.width = cv.height = 0;
+    return { data, page: p.n, rect: r.map((v) => Math.round(v)) };
+  }
+
+  const backStack = [];
+  function pushBack() {  // every jump (link, preview card, find) remembers where you were; the parent offers "읽던 곳으로"
+    if (!isReady) return;
+    backStack.push(position()); if (backStack.length > 30) backStack.shift();
+    window.dispatchEvent(new CustomEvent("pr-jump"));
+  }
+  function back() { const b = backStack.pop(); return b ? goto(b.page, b.y) : false; }
+  let outlineP = null;
+  function outline() {
+    return outlineP || (outlineP = ready.then(async () => {
+      const out = [], items = await pdf.getOutline().catch(() => null);
+      const walk = async (list, level) => {
+        for (const it of list || []) {
+          const d = it.dest ? await resolveDest(it.dest).catch(() => null) : null;
+          out.push({ title: String(it.title || "").replace(/\s+/g, " ").trim(), page: d ? d.page : null, level, y: d ? Math.round(d.y / pgs[d.i].bh * 1e4) / 1e4 : null });
+          await walk(it.items, level + 1);
+        }
+      };
+      await walk(items, 0);
+      return out;
+    }).catch(() => []));
+  }
+
+  let scrollQueued = false;
+  addEventListener("scroll", () => {
+    hideCard();  // also cancels a pending hover preview
+    if (!scrollQueued) { scrollQueued = true; requestAnimationFrame(() => { scrollQueued = false; updateCurrent(); }); }
+  }, { passive: true });
+  addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { hideCard(); return; }
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+    const k = e.key, c = e.code;
+    if (k === "=" || k === "+" || c === "Equal" || c === "NumpadAdd") { e.preventDefault(); zoomIn(); }
+    else if (k === "-" || k === "_" || c === "Minus" || c === "NumpadSubtract") { e.preventDefault(); zoomOut(); }
+    else if (k === "0" || c === "Digit0" || c === "Numpad0") { e.preventDefault(); setZoom(1); }
+  });
+  // Selection feels steadier in Chrome when the end-of-content block starts at the press point (as in pdf.js)
+  document.addEventListener("mousedown", (e) => {
+    if (card && !card.contains(e.target)) hideCard();
+    const tl = e.target.closest && e.target.closest(".textLayer"), end = tl && tl.querySelector(".endOfContent");
+    if (!end) return;
+    if (e.target !== tl) { const b = tl.getBoundingClientRect(); end.style.top = (clamp((e.clientY - b.top) / b.height, 0, 1) * 100).toFixed(2) + "%"; }
+    end.classList.add("active");
+  }, true);
+  document.addEventListener("mouseup", () => {
+    for (const end of document.querySelectorAll(".endOfContent.active")) { end.style.top = ""; end.classList.remove("active"); }
+  }, true);
+
+  const PR = window.PR = {
+    ready,
+    get pages() { return pgs.length; },
+    get page() { return curPage; },
+    get zoom() { return zoom; },
+    setZoom, zoomIn, zoomOut, fit: () => setZoom(1),
+    goto, position, outline, find, back,
+    locate: async (kind, label) => { const t = await locate(kind, label); return t ? { page: t.pi + 1 } : null; },
+    capture, snapshot,
+  };
+
+  (async () => {
+    try {
+      pdf = await pdfjsLib.getDocument("/paper/" + encodeURIComponent(params.get("id")) + "/pdf").promise;
+      const proxies = await Promise.all(Array.from({ length: pdf.numPages }, (_, i) => pdf.getPage(i + 1)));
+      msg.remove();
+      pgs = proxies.map((proxy, i) => {
+        const vp1 = proxy.getViewport({ scale: 1 }), div = document.createElement("div");
+        div.className = "page"; div.dataset.n = i + 1;
+        return { i, n: i + 1, proxy, vp1, bw: vp1.width, bh: vp1.height, div, W: 0, H: 0, scale: 1, near: false,
+          canvas: null, canvasKey: "", task: null, taskKey: "", tl: null, tlBusy: false, tlKey: 0,
+          textDivs: null, textProps: null, tc: null, lines: null, linksDone: false };
+      });
+      const frag = document.createDocumentFragment();
+      for (const p of pgs) frag.appendChild(p.div);
+      wrap.appendChild(frag);
+      fitW = measureFit();
+      applySizes();
+      isReady = true;
+      for (const p of pgs) io.observe(p.div);
+      if (pgs[0].W > vw()) scrollTo((document.documentElement.scrollWidth - vw()) / 2, 0);  // opened zoomed in: center the page
+      const start = parseInt(params.get("page"), 10);
+      if (start > 0) goto(start, parseFloat(params.get("y")) || 0);
+      updateCurrent();
+      readyOk(PR);
+      buildAllText().catch((e) => console.warn("PDF text layers", e));
+    } catch (e) {
+      msg.textContent = "PDF를 열지 못했습니다: " + (e && e.message || e);
+      readyFail(e);
+    }
+  })();
+})();
+</script>
+</body>
+</html>
