@@ -1,0 +1,23 @@
+# ---- 개인 데이터: 절대 올리지 않음 ----
+# 서재(논문 PDF·전문·대화·메모·세미나자료·폴더·기능 사용 기록)
+library/
+# 설명 방식 기억(대화에서 「앞으로 ~해 줘」로 쌓이는 개인 규칙)
+memory.md
+# OpenAlex API 키
+openalex_key.txt
+.backup/
+*.bak
+*.bad-*
+
+# ---- Python ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- OS · 편집기 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
